@@ -89,11 +89,11 @@ class MaskingQualityModule(nn.Module):
         """Extract and smooth a spatial quality map from DeQA."""
         b, c, h, w = x.shape
         
-        # 检查输入通道数，DeQA 需要 RGB 图像(3通道)
+        
         if c != 3:
             print(f"Warning: Input tensor to extract_deqa_quality_map has {c} channels. Converting to compatible format.")
-            # 对于非 RGB 输入，创建一个默认质量图
-            default_quality = 0.5  # 默认中等质量
+            
+            default_quality = 0.5  
             deqa_quality = torch.ones((b, 1, h, w), device=x.device) * default_quality
             return deqa_quality
         
@@ -110,7 +110,7 @@ class MaskingQualityModule(nn.Module):
         except Exception as e:
             print(f"Error in extract_deqa_quality_map: {e}")
             print(f"Input shape: {x.shape}, values range: {x.min().item()}-{x.max().item()}")
-            # 出错时返回默认质量图
+            
             deqa_quality = torch.ones((b, 1, h, w), device=x.device) * 0.5
             return deqa_quality
 
@@ -122,7 +122,7 @@ class MaskingQualityModule(nn.Module):
         return gaussian_blur(gradient, self.smooth_kernel_size, self.smooth_sigma)
 
     def forward(self, x, timestep=None):
-        # 保存原始输入用于 DeQA 处理（如果是 3 通道 RGB 图像）
+        #
         original_x = x
         original_channels = x.shape[1]
         is_rgb = (original_channels == 3)
@@ -137,12 +137,11 @@ class MaskingQualityModule(nn.Module):
                 adapter = nn.Conv2d(in_channels, self.channels, kernel_size=1).to(x.device)
                 x = adapter(x)
         
-        # 使用原始输入（如果是 RGB）或进行特征转换来获取 DeQA 质量图
+        # 
         if is_rgb:
             deqa_quality = self.extract_deqa_quality_map(original_x)
         else:
-            # 对于非 RGB 输入，使用模型处理后的特征
-            # 创建一个假的质量图作为备选
+            # 
             b, _, h, w = x.shape
             deqa_quality = torch.ones((b, 1, h, w), device=x.device) * 0.5
         
@@ -447,20 +446,16 @@ class DenoisingDiffusion(pl.LightningModule):
         # 确保使用原始 RGB 图像计算 DeQA 质量分数
         quality_scores = self.extract_deqa_features(input_x)
         
-        # 使用原始 RGB 图像作为 masking_module 的输入（避免使用特征张量）
         attention_mask, quality_map, boundary_weight = self.masking_module(input_x, None)
         
-        # 获取样本残差
         samples_residual, _ = self.DiffSampler.sample_high_res(
             input_x, train=False, quality_score=quality_scores, 
             mask=attention_mask, boundary_weight=boundary_weight
         )
         
-        # 修复样本残差的形状
         if samples_residual.dim() == 5:
             samples_residual = samples_residual[:, 0, :, :, :]
         
-        # 确保样本残差与输入具有相同的形状
         if samples_residual.shape[1] != input_x.shape[1]:
             if samples_residual.shape[1] > input_x.shape[1]:
                 samples_residual = samples_residual[:, :input_x.shape[1]]
@@ -473,7 +468,6 @@ class DenoisingDiffusion(pl.LightningModule):
                                 device=samples_residual.device)
                 ], dim=1)
         
-        # 确保空间维度匹配
         if (samples_residual.shape[2] != input_x.shape[2] or 
             samples_residual.shape[3] != input_x.shape[3]):
             samples_residual = F.interpolate(
@@ -483,10 +477,10 @@ class DenoisingDiffusion(pl.LightningModule):
                 align_corners=False
             )
         
-        # 计算最终样本
+        
         samples = input_x + samples_residual
         
-        # 确保样本有 3 个通道用于保存
+        
         if samples.shape[1] != 3:
             if samples.shape[1] > 3:
                 samples_to_save = samples[:, :3]
@@ -500,7 +494,7 @@ class DenoisingDiffusion(pl.LightningModule):
         else:
             samples_to_save = samples
         
-        # 保存图像
+        
         max_batch_items = min(5, samples_to_save.shape[0])
         
         if self.config.train_type == True:
@@ -508,7 +502,7 @@ class DenoisingDiffusion(pl.LightningModule):
                 filename = f"sample_{self.current_epoch}.png"
                 save_image(samples_to_save[:max_batch_items], os.path.join(self.save_path, filename))
                 
-                # 处理残差保存
+                
                 if samples_residual.shape[1] != 3:
                     if samples_residual.shape[1] > 3:
                         residual_to_save = samples_residual[:, :3]
@@ -534,7 +528,6 @@ class DenoisingDiffusion(pl.LightningModule):
             filename = f"sample_{img_id[0]}.png"
             save_image(samples_to_save[:1], os.path.join(self.save_path, filename))
         
-        # 计算指标
         psnr = batch_PSNR(samples.float(), target.float(), ycbcr=True)
         ssim = batch_SSIM(samples.float(), target.float(), ycbcr=True)
         lpips_score = self.lpips_score_fn(samples.float(), target.float())
@@ -550,8 +543,6 @@ class DenoisingDiffusion(pl.LightningModule):
         self.log('val_quality_gain', quality_gain)
         
         return {"psnr": psnr, "ssim": ssim, "lpips": lpips_score, "quality_gain": quality_gain}
-
-
 
     
     def train_dataloader(self):
