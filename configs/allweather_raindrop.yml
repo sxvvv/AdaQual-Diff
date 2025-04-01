@@ -1,0 +1,59 @@
+data:
+    dataset: "Raindrop"
+    image_size: 256
+    channels: 3
+    num_workers: 4
+    data_dir: "/data/suxin/raindrop/train"
+    conditional: True
+    val_data_dir: "/data/suxin/raindrop/test_a"
+    val_crop: True
+
+model:
+    img_channel: 6  # Input
+    out_channel: 3  # Output: restored RGB
+    width: 64
+    enc_blk_nums: [1, 1, 1, 18]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+    is_prompt_pool: True  # Enable quality-aware prompt mechanism
+
+diffusion:
+    type: DDIM
+    beta_schedule: linear
+    beta_start: 0.0001
+    beta_end: 0.02
+    num_train_timesteps: 1000
+    eta: 0
+    sampling_timesteps: 2  
+
+training:
+    batch_size: 12
+    snapshot_freq: 10000
+    validation_freq: 10000
+
+log_name: Raindrop_QualityAware
+
+RESUME: False
+resume_checkpoint_path: ''  # Update this path if resuming
+
+Trainer:
+    check_val_every_n_epoch: 1
+    accumulate_grad_batches: 1
+    max_epochs: 10000
+    max_steps: 1500000
+    accelerator: 'gpu'
+    devices: [1]
+    precision: '16-mixed'
+    strategy: 'ddp_find_unused_parameters_true'
+    log_every_n_steps: 1
+
+sampling:
+    batch_size: 4
+    last_only: True
+
+optim:
+    weight_decay: 0.000
+    optimizer: "Adam"
+    lr: 0.0002
+    amsgrad: False
+    eps: 0.0001
