@@ -1,294 +1,285 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, reduce
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange, reduce
+from einops import rearrange
 from .module_util import LayerNorm
-from diffusers.models.embeddings import GaussianFourierProjection, TimestepEmbedding, Timesteps
-
-class QualityFeatureExtractor(nn.Module):
-    def __init__(self, embed_dim=768, quality_features_dim=4096):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.global_proj = nn.Linear(quality_features_dim, embed_dim)
-        self.local_proj = nn.Sequential(
-            nn.Linear(1, 64), nn.LayerNorm(64), nn.GELU(), nn.Linear(64, embed_dim)
-        )
-        self.quality_level_embeddings = nn.Parameter(torch.randn(5, embed_dim) * 0.02)
-    
-    def forward(self, quality_score, quality_variance=None):
-        batch_size = quality_score.shape[0]
-        device = quality_score.device  # Use the device of the input tensor
-        normalized_scores = (quality_score - 1) / 4  # Map [1,5] to [0,1]
-        level_weights = torch.zeros(batch_size, 5, device=device)
-        for b in range(batch_size):
-            score = quality_score[b].item()
-            lower_idx = max(0, min(3, int(score - 1)))
-            upper_idx = lower_idx + 1
-            alpha = score - (lower_idx + 1)
-            level_weights[b, lower_idx] = 1 - alpha
-            level_weights[b, upper_idx] = alpha
-        # Ensure quality_level_embeddings is on the same device
-        quality_embeddings = torch.matmul(level_weights, self.quality_level_embeddings.to(device))
-        # local_proj will automatically use its parameters' device, assuming the model is on the correct device
-        quality_features = self.local_proj(quality_score.to(self.local_proj[0].weight.device, dtype=self.local_proj[0].weight.dtype))
-        return quality_embeddings + quality_features.to(quality_embeddings.device)
-
+from diffusers.models.embeddings import Timesteps
+from models_prompt.modules.prompt import AdaptiveQualityPrompt
 
 class Attention_cross(nn.Module):
-    def __init__(self, dim, text_dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    """ Cross-attention module for fusing prompts with image features """
+    def __init__(self, dim, context_dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
+        self.dim = dim
+        self.context_dim = context_dim
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
-        self.q = nn.Linear(dim, dim)
-        self.kv = nn.Linear(text_dim, 2 * dim // self.num_heads)
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(context_dim, dim * 2, bias=qkv_bias)
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-    
-    def forward(self, x, guidance):
+
+    def forward(self, x, context):
+        """
+        Args:
+            x: Input features [B, C, H, W]
+            context: Context features [B, SeqLen, context_dim]
+        Returns:
+            Attention-fused features [B, C, H, W]
+        """
         B, C, H, W = x.shape
-        x = x.reshape(B, C, H * W).permute(0, 2, 1)
-        q = self.q(x).reshape(B, H * W, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        kv = self.kv(guidance).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
+        x_flat = x.view(B, C, H * W).permute(0, 2, 1)  # [B, H*W, C]
+
+        q = self.q(x_flat)
+        q = q.view(B, H * W, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        kv = self.kv(context)
+        k, v = kv.chunk(2, dim=-1)
+
+        k = k.view(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        v = v.view(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, H * W, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x.permute(0, 2, 1).reshape(B, C, H, W)
 
-class QualityAwarePrompt(nn.Module):
-    """Quality-Driven Dynamic Prompt Distillation"""
-    def __init__(self, length_min=5, length_max=64, embed_dim=512, pool_size=20, top_k=5, beta=0.5):
-        super().__init__()
-        self.length_min = length_min
-        self.length_max = length_max
-        self.embed_dim = embed_dim
-        self.pool_size = pool_size
-        self.top_k = top_k
-        self.beta = beta  # Quality influence factor
-        
-        self.prompt_keys = nn.Parameter(torch.randn(pool_size, embed_dim))
-        self.prompt_embeddings = nn.Parameter(torch.randn(pool_size, length_max, embed_dim))
-        self.quality_proj = nn.Sequential(
-            nn.Linear(1, embed_dim//2), nn.LayerNorm(embed_dim//2), nn.ReLU(), nn.Linear(embed_dim//2, embed_dim)
-        )
-        nn.init.xavier_uniform_(self.prompt_keys)
-        nn.init.xavier_uniform_(self.prompt_embeddings)
-    
-    def compute_dynamic_length(self, quality_score):
-        mu = quality_score.mean().item()  # [1,5]
-        length = self.length_min + (self.length_max - self.length_min) * (1 - mu / 5)
-        return max(self.length_min, min(self.length_max, int(length)))
-    
-    def update_frequency_table(self, selected_idx):
-        # Increment the frequency table based on selected indices
-        for idx in selected_idx:
-            self.prompt_frequency_table[idx] += 1
+        attended_x = (attn @ v)
+        attended_x = attended_x.transpose(1, 2).reshape(B, H * W, C)
 
-    def penalize_frequent_prompts(self, similarity_scores):
-        # Penalize prompts based on frequency by subtracting the normalized frequency
-        # from the similarity scores
-        self.prompt_frequency_table = self.prompt_frequency_table.to(similarity_scores.device)
-        penalties = self.prompt_frequency_table / self.prompt_frequency_table.max()
-        adjusted_scores = similarity_scores - penalties.unsqueeze(0)  # Broadcasting the penalties
-        return adjusted_scores
+        output = self.proj(attended_x)
+        output = self.proj_drop(output)
 
-    def l2_normalize(self, x, dim=None, epsilon=1e-12):
-        """Normalizes a given vector or matrix."""
-        square_sum = torch.sum(x ** 2, dim=dim, keepdim=True)
-        x_inv_norm = torch.rsqrt(torch.maximum(square_sum, torch.tensor(epsilon, device=x.device)))
-        return x * x_inv_norm
+        return output.permute(0, 2, 1).view(B, C, H, W)
 
-    def forward(self, x_embed, quality_score=None):
-        batch_size = x_embed.shape[0]
-        query_features = self.quality_proj(quality_score) if quality_score is not None else x_embed.mean(1)
-        
-        similarities = F.cosine_similarity(
-            query_features.unsqueeze(1).expand(-1, self.pool_size, -1),
-            self.prompt_keys.unsqueeze(0).expand(batch_size, -1, -1),
-            dim=2
-        )
-        weights = torch.softmax(similarities * (1 + self.beta * quality_score.mean()), dim=1)
-        
-        prompted_embeddings = []
-        max_length = self.length_max  # Ensure all tensors have the same length
-        for b in range(batch_size):
-            length = self.compute_dynamic_length(quality_score[b:b+1])
-            topk_indices = torch.topk(weights[b], self.top_k)[1]
-            selected_prompts = self.prompt_embeddings[topk_indices, :length]
-            padded_prompts = F.pad(selected_prompts, (0, 0, 0, max_length - length))  # Pad to max_length
-            weighted_prompt = (padded_prompts * weights[b, topk_indices].view(-1, 1, 1)).sum(0)
-            prompted_embeddings.append(weighted_prompt)
-        
-        return {
-            'prompted_embedding_e': torch.stack(prompted_embeddings, dim=0),
-            'prompt_loss': torch.tensor(0.0, device=x_embed.device)
-        }
 
 class SimpleGate(nn.Module):
+    """ Simple gating mechanism """
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
 
+
 class NAFBlock(nn.Module):
+    """ NAFNet basic block with time embedding support """
     def __init__(self, c, time_emb_dim=None, DW_Expand=2, FFN_Expand=2, drop_out_rate=0.):
         super().__init__()
-        self.mlp = nn.Sequential(SimpleGate(), nn.Linear(time_emb_dim // 2, c * 4)) if time_emb_dim else None
         dw_channel = c * DW_Expand
-        self.conv1 = nn.Conv2d(c, dw_channel, 1, bias=True)
-        self.conv2 = nn.Conv2d(dw_channel, dw_channel, 3, padding=1, groups=dw_channel, bias=True)
-        self.conv3 = nn.Conv2d(dw_channel // 2, c, 1, bias=True)
-        self.sca = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dw_channel // 2, dw_channel // 2, 1, bias=True))
+        ffn_channel = c * FFN_Expand
+        
+        self.mlp = nn.Sequential(SimpleGate(), nn.Linear(time_emb_dim // 2, c * 4)) if time_emb_dim else None
+        
+        self.conv1 = nn.Conv2d(c, dw_channel, 1, padding=0, stride=1, groups=1, bias=True)
+        self.conv2 = nn.Conv2d(dw_channel, dw_channel, 3, padding=1, stride=1, groups=dw_channel, bias=True)
+        self.conv3 = nn.Conv2d(dw_channel // 2, c, 1, padding=0, stride=1, groups=1, bias=True)
+        
+        self.sca = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dw_channel//2, dw_channel // 2, 1, padding=0, stride=1, groups=1, bias=True))
         self.sg = SimpleGate()
-        ffn_channel = FFN_Expand * c
-        self.conv4 = nn.Conv2d(c, ffn_channel, 1, bias=True)
-        self.conv5 = nn.Conv2d(ffn_channel // 2, c, 1, bias=True)
-        self.norm1 = nn.LayerNorm(c)
-        self.norm2 = nn.LayerNorm(c)
+        
+        self.conv4 = nn.Conv2d(c, ffn_channel, 1, padding=0, stride=1, groups=1, bias=True)
+        self.conv5 = nn.Conv2d(ffn_channel // 2, c, 1, padding=0, stride=1, groups=1, bias=True)
+        
+        self.norm1 = LayerNorm(c)
+        self.norm2 = LayerNorm(c)
         self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
         self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
-        self.beta = nn.Parameter(torch.zeros(1, c, 1, 1))
-        self.gamma = nn.Parameter(torch.zeros(1, c, 1, 1))
-    
+        
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+
     def time_forward(self, time, mlp):
+        """ Process time embedding for AdaLN modulation """
         time_emb = mlp(time)
-        return rearrange(time_emb, 'b c -> b c 1 1').chunk(4, dim=1)
-    
-    def forward(self, x):
-        inp, time = x
-        shift_att, scale_att, shift_ffn, scale_ffn = self.time_forward(time, self.mlp)
-        x = self.norm1(inp.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x = x * (scale_att + 1) + shift_att
+        time_emb = rearrange(time_emb, 'b c -> b c 1 1')
+        return time_emb.chunk(4, dim=1)
+
+    def forward(self, x_time_tuple):
+        """ Forward pass with time conditioning """
+        inp, time_emb = x_time_tuple
+
+        # Time-dependent modulation parameters
+        shift_att, scale_att, shift_ffn, scale_ffn = self.time_forward(time_emb, self.mlp)
+
+        # Attention block
+        x = inp
+        x_norm1 = self.norm1(x)
+        x = x_norm1 * (scale_att + 1) + shift_att
+
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.sg(x)
         x = x * self.sca(x)
         x = self.conv3(x)
+
         x = self.dropout1(x)
         y = inp + x * self.beta
-        x = self.norm2(y.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x = x * (scale_ffn + 1) + shift_ffn
+
+        # FFN block
+        x_norm2 = self.norm2(y)
+        x = x_norm2 * (scale_ffn + 1) + shift_ffn
+
         x = self.conv4(x)
         x = self.sg(x)
         x = self.conv5(x)
-        x = self.dropout2(x)
-        return x + y * self.gamma, time
 
-class QualityEnhancer(nn.Module):
-    """Quality-aware feature enhancement module"""
-    def __init__(self, channels):
-        super().__init__()
-        self.enhance = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, 1, bias=True)
-        )
-        self.weight_proj = nn.Linear(768, channels)
-    
-    def forward(self, feature, quality_embedding):
-        weight = torch.sigmoid(self.weight_proj(quality_embedding)).view(-1, feature.shape[1], 1, 1)
-        enhanced = self.enhance(feature)
-        return feature * (1 + weight * enhanced)
+        x = self.dropout2(x)
+        out = y + x * self.gamma
+
+        return out, time_emb
+
 
 class NAFNet(nn.Module):
-    """NAFNet with Quality-Aware Multi-Scale Feature Enhancement"""
-    def __init__(self, img_channel=6, out_channel=3, text_dim=512, width=64, middle_blk_num=1, enc_blk_nums=[1, 1, 1, 18], dec_blk_nums=[1, 1, 1, 1], is_prompt_pool=True):
+    """ NAFNet for diffusion models with time embedding and quality prompting """
+    def __init__(self, img_channel=6, out_channel=3, width=64, middle_blk_num=1,
+                 enc_blk_nums=[1, 1, 1, 18], dec_blk_nums=[1, 1, 1, 1],
+                 upscale=1, trans_out=False, is_prompt_pool=True,
+                 prompt_embed_dim=256, prompt_pool_size=10,
+                 prompt_max_length=32, prompt_min_length=5,
+                 attn_num_heads=8, attn_qkv_bias=False, attn_drop=0., proj_drop=0.
+                 ):
         super().__init__()
+        self.upscale = upscale
+        self.trans_out = trans_out
         self.is_prompt_pool = is_prompt_pool
+
+        # Time embedding
+        fourier_dim = width
         time_dim = width * 4
+
         self.time_mlp = nn.Sequential(
-            Timesteps(width, flip_sin_to_cos=True, downscale_freq_shift=0.),
-            nn.Linear(width, time_dim * 2),
+            Timesteps(fourier_dim, flip_sin_to_cos=True, downscale_freq_shift=0.),
+            nn.Linear(fourier_dim, time_dim * 2),
             SimpleGate(),
             nn.Linear(time_dim, time_dim)
         )
-        self.intro = nn.Conv2d(img_channel, width, 3, padding=1, bias=True)
-        self.ending = nn.Conv2d(width, out_channel, 3, padding=1, bias=True)
-        
+
+        # Input and output convolutions
+        self.intro = nn.Conv2d(img_channel, width, kernel_size=3, padding=1, stride=1, groups=1, bias=True)
+        self.ending = nn.Conv2d(width, out_channel, kernel_size=3, padding=1, stride=1, groups=1, bias=True)
+        if self.trans_out:
+            self.ending_trans = nn.Sequential(
+                nn.Conv2d(width, 1, kernel_size=3, padding=1, stride=1, groups=1, bias=True),
+                nn.Sigmoid()
+            )
+
+        # Network structure
         self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        self.middle_blks = nn.ModuleList()
+        self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
-        self.enhancers = nn.ModuleList()
+
+        # Encoder path
         chan = width
         for num in enc_blk_nums:
-            self.encoders.append(nn.Sequential(*[NAFBlock(chan, time_dim) for _ in range(num)]))
-            self.downs.append(nn.Conv2d(chan, 2 * chan, 2, 2))
-            self.enhancers.append(QualityEnhancer(chan))
+            self.encoders.append(
+                nn.Sequential(*[NAFBlock(chan, time_dim) for _ in range(num)])
+            )
+            self.downs.append(
+                nn.Conv2d(chan, 2 * chan, kernel_size=2, stride=2)
+            )
             chan *= 2
-        
-        self.middle_blks = nn.Sequential(*[NAFBlock(chan, time_dim) for _ in range(middle_blk_num)])
-        
+
+        # Middle blocks
+        self.middle_blks = nn.Sequential(
+            *[NAFBlock(chan, time_dim) for _ in range(middle_blk_num)]
+        )
+
+        # Quality prompting components
         if self.is_prompt_pool:
-            self.prompt_pool = QualityAwarePrompt(length_min=5, length_max=64, embed_dim=chan, pool_size=20, top_k=5)
-            self.atten_list = nn.ModuleList([Attention_cross(chan, chan) for _ in range(2)])
-        
-        self.ups = nn.ModuleList()
-        self.decoders = nn.ModuleList()
+            self.prompt_pool = AdaptiveQualityPrompt(
+                embed_dim=prompt_embed_dim,
+                pool_size=prompt_pool_size,
+                max_length=prompt_max_length,
+                min_length=prompt_min_length
+            )
+            self.attn_local = Attention_cross(
+                dim=chan,
+                context_dim=prompt_embed_dim,
+                num_heads=attn_num_heads, qkv_bias=attn_qkv_bias,
+                attn_drop=attn_drop, proj_drop=proj_drop
+            )
+            self.attn_global = Attention_cross(
+                dim=chan,
+                context_dim=prompt_embed_dim,
+                num_heads=attn_num_heads, qkv_bias=attn_qkv_bias,
+                attn_drop=attn_drop, proj_drop=proj_drop
+            )
+
+        # Decoder path
         for num in dec_blk_nums:
-            self.ups.append(nn.Sequential(nn.Conv2d(chan, chan * 2, 1, bias=False), nn.PixelShuffle(2)))
+            self.ups.append(nn.Sequential(
+                nn.Conv2d(chan, chan // 2 * 4, kernel_size=1, bias=False),
+                nn.PixelShuffle(2)
+            ))
             chan //= 2
             self.decoders.append(nn.Sequential(*[NAFBlock(chan, time_dim) for _ in range(num)]))
-        
+
+        # Calculate padding size
         self.padder_size = 2 ** len(self.encoders)
-    
+
     def check_image_size(self, x):
+        """ Ensure input size is divisible by padder_size """
         _, _, h, w = x.size()
         mod_pad_h = (self.padder_size - h % self.padder_size) % self.padder_size
         mod_pad_w = (self.padder_size - w % self.padder_size) % self.padder_size
-        return F.pad(x, (0, mod_pad_w, 0, mod_pad_h))
-    
-    def forward(self, inp, time=1., depth_feature=None, quality_score=None):
-        timesteps = torch.tensor([time], dtype=torch.long, device=inp.device) if not torch.is_tensor(time) else time
-        timesteps = timesteps * torch.ones(inp.shape[0], dtype=timesteps.dtype, device=timesteps.device)
-        time_mlp_device = next(self.time_mlp.parameters()).device
-        t = self.time_mlp(timesteps.to(time_mlp_device))
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h))
+        return x
+
+    def forward(self, inp, time=1., quality_condition=None, raw_quality_scores=None):
+        """ Forward pass with time and quality conditioning """
+        time = torch.tensor([time], dtype=torch.long, device=inp.device) if not torch.is_tensor(time) else time
+        if time.ndim == 0: time = time.unsqueeze(0)
+        if time.shape[0] != inp.shape[0]: time = time.expand(inp.shape[0])
+        t_emb = self.time_mlp(time)
         
+        H_orig, W_orig = inp.shape[-2:]
         x = self.check_image_size(inp)
         x = self.intro(x)
-        
         encs = [x]
-        quality_embedding = QualityFeatureExtractor(embed_dim=768)(quality_score) if quality_score is not None else None
         
-        for idx, (encoder, down, enhancer) in enumerate(zip(self.encoders, self.downs, self.enhancers)):
-            x, _ = encoder([x, t])
-            if quality_embedding is not None:
-                x = enhancer(x, quality_embedding)
-            encs.append(x)
+        # Encoder path
+        for i, (encoder, down) in enumerate(zip(self.encoders, self.downs)):
+            x, _ = encoder([x, t_emb])
             x = down(x)
+            encs.append(x)
         
-        x, _ = self.middle_blks([x, t])
-        b, c, h, w = x.shape
-        
+        # Middle blocks
+        x, _ = self.middle_blks([x, t_emb])
+
+        # Prompt integration
         prompt_loss = torch.tensor(0.0, device=inp.device)
-        if self.is_prompt_pool and quality_score is not None:
-            prompt = self.prompt_pool(x.reshape(b, c, h * w).permute(0, 2, 1), quality_score)
-            prompt_e = prompt['prompted_embedding_e']
-            x = self.atten_list[0](x, prompt_e)
-            prompt_loss = prompt['prompt_loss']
-        
-        for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
+        if self.is_prompt_pool and raw_quality_scores is not None:
+            b, c_mid, h_mid, w_mid = x.shape
+            x_flat = x.view(b, c_mid, h_mid * w_mid).permute(0, 2, 1)
+
+            quality_prompt_dict = self.prompt_pool(x_flat, raw_quality_scores)
+
+            prompt_e = quality_prompt_dict.get('prompted_embedding_e')
+            prompt_g = quality_prompt_dict.get('prompted_embedding_g')
+            prompt_loss = quality_prompt_dict.get('prompt_loss', torch.tensor(0.0, device=inp.device))
+
+            # Fuse prompts with features
+            if prompt_e is not None:
+                 x = self.attn_local(x, prompt_e)
+            if prompt_g is not None:
+                 x = self.attn_global(x, prompt_g)
+
+        # Decoder path with skip connections
+        for i, (decoder, up, enc_skip) in enumerate(zip(self.decoders, self.ups, encs[::-1][1:])):
             x = up(x)
             x = x + enc_skip
-            x, _ = decoder([x, t])
+            x, _ = decoder([x, t_emb])
         
-        x = self.ending(x + encs[0])
-        input_img_channels = inp.shape[1] // 2
-        if input_img_channels * 2 == inp.shape[1]:
-            orig_img = inp[:, :input_img_channels]
-            return torch.cat([orig_img, x], dim=1), prompt_loss
-        return x, prompt_loss
-
-# Example usage and testing
-if __name__ == "__main__":
-    model = NAFNet(img_channel=6, out_channel=3, width=64, enc_blk_nums=[1, 1, 1, 18], dec_blk_nums=[1, 1, 1, 1], is_prompt_pool=True).cuda()
-    x = torch.ones([1, 6, 256, 256]).cuda()
-    quality_score = torch.tensor([[3.5]], device='cuda')
-    result, prompt_loss = model(x, time=1., quality_score=quality_score)
-    print(result.shape, prompt_loss.item())
+        output = self.ending(x + encs[0])
+        output = output[..., :H_orig, :W_orig]
+        
+        return_dict = {'predicted_residual': output, 'prompt_loss': prompt_loss}
+        if self.trans_out:
+            trans_map = self.ending_trans(x + encs[0])[..., :H_orig, :W_orig]
+            return_dict['trans_map'] = trans_map
+        return return_dict
