@@ -408,12 +408,9 @@ class DenoisingDiffusion(pl.LightningModule):
 
         samples_pil = self.tensor_to_pil(samples)
         with torch.no_grad():
-            try:
-                output_deqa_scores = self.safe_deqa_score(samples_pil)
-                deqa_score_val = torch.mean(output_deqa_scores).item()
-            except Exception:
-                deqa_score_val = 3.0
-
+            output_deqa_scores = self.safe_deqa_score(samples_pil)
+            deqa_score_val = torch.mean(output_deqa_scores).item()
+            
         self.log('psnr', psnr, on_step=False, on_epoch=True, sync_dist=True)
         self.log('ssim', ssim, on_step=False, on_epoch=True, sync_dist=True)
         self.log('lpips', lpips_score, on_step=False, on_epoch=True, sync_dist=True)
