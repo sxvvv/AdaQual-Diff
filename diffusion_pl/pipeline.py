@@ -92,7 +92,6 @@ class SR3Sampler:
             # Extract the residual part of img to pass to the scheduler
             img_residual = img[:, 3:6]  # [4, 3, 256, 256]
             
-            # Update residual using the scheduler
             scheduler_output = self.scheduler.step(
                 model_output=predicted_residual,  # [4, 3, 256, 256] - predicted noise/residual
                 timestep=t,
@@ -107,7 +106,6 @@ class SR3Sampler:
         # Final output: the residual part after sampling
         final_residual = img[:, 3:6]  # [4, 3, 256, 256]
         
-        # Handle prompt loss if applicable
         prompt_loss = model_output_dict.get('prompt_loss', torch.tensor(0.0, device=device))
         avg_prompt_loss = prompt_loss if train else prompt_loss / len(self.scheduler.timesteps)
         
