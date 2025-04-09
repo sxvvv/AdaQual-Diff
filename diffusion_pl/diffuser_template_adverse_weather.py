@@ -238,15 +238,9 @@ class DenoisingDiffusion(pl.LightningModule):
         ]
         optimizer = Utils.optimize.get_optimizer(self.config, parameters)
 
-        if hasattr(self, 'trainer') and self.trainer.datamodule:
-            num_batches = len(self.trainer.datamodule.train_dataloader())
-            t_max_steps = (self.max_steps // num_batches) if num_batches > 0 else self.max_steps
-        else:
-            t_max_steps = self.max_steps
-
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=t_max_steps,
+            T_max=self.max_steps//len(self.train_dataloader()),
             eta_min=self.config.optim.lr * 1e-2
         )
         self.optimizer = optimizer
@@ -334,40 +328,10 @@ class DenoisingDiffusion(pl.LightningModule):
         if torch.isnan(loss_noise).any() or torch.isinf(loss_noise).any():
             return None
 
-        run_online_sampling = False
-        if run_online_sampling:
-            with torch.no_grad():
-                sample_output_dict = self.DiffSampler.sample_high_res(
-                    low_res=x,
-                    train=True,
-                    quality_condition=quality_embedding.detach(),
-                    raw_quality_scores=deqa_score
-                )
-                sample_residual = sample_output_dict['sample']
-                prompt_loss_sample = sample_output_dict.get('prompt_loss', torch.tensor(0.0, device=self.device))
-                if torch.isnan(sample_residual).any() or torch.isinf(sample_residual).any():
-                    sample_residual = torch.zeros_like(sample_residual)
-                    prompt_loss_sample = torch.tensor(0.0, device=self.device)
-                if torch.isnan(prompt_loss_sample).any() or torch.isinf(prompt_loss_sample).any():
-                    prompt_loss_sample = torch.tensor(0.0, device=self.device)
-
-            samples = x + sample_residual
-            if torch.isnan(samples).any() or torch.isinf(samples).any():
-                loss_samples = torch.tensor(0.0, device=self.device)
-                psnr_train_online = torch.tensor(0.0, device=self.device)
-            else:
-                psnr_train_online = batch_PSNR(samples.detach().float(), gt.float(), ycbcr=True)
-                if torch.isnan(psnr_train_online).any() or torch.isinf(psnr_train_online).any():
-                    psnr_train_online = torch.tensor(0.0, device=self.device)
-
-                samples_clamped = torch.clamp(samples, 1e-8, 1.0)
-                loss_samples = self.loss_psnr(samples_clamped, gt_clamped)
-                if torch.isnan(loss_samples).any() or torch.isinf(loss_samples).any():
-                    loss_samples = torch.tensor(0.0, device=self.device)
-        else:
-            loss_samples = torch.tensor(0.0, device=self.device)
-            prompt_loss_sample = torch.tensor(0.0, device=self.device)
-            psnr_train_online = torch.tensor(0.0, device=self.device)
+        
+        loss_samples = torch.tensor(0.0, device=self.device)
+        prompt_loss_sample = torch.tensor(0.0, device=self.device)
+        psnr_train_online = torch.tensor(0.0, device=self.device)
 
         quality_weight = deqa_score.view(-1) / 5.0
         if torch.isnan(quality_weight).any() or torch.isinf(quality_weight).any() or quality_weight.min() < 0:
