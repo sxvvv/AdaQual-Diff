@@ -1,5 +1,16 @@
 # AdaQual-Diff🚀  
 *Diffusion-Based Image Restoration via Adaptive Quality Prompting*
+* [Xin Su](https://scholar.google.com/citations?user=0AvoocgAAAAJ&hl=zh-CN)<sup>1</sup>  
+* [Chen Wu]<sup>2</sup>  
+* Yu Zhang<sup>3</sup>  
+* Chen Lyu<sup>4</sup>  
+* [Zhuoran Zheng](https://scholar.google.com/citations?user=pXzPL-sAAAAJ&hl=zh-CN)<sup>5 ✉️</sup>  
+
+<sup>1</sup> Fuzhou University  
+<sup>2</sup> University of Science and Technology of China  
+<sup>3</sup> University of the Chinese Academy of Sciences  
+<sup>4</sup> Shandong Normal University  
+<sup>5</sup> Sun Yat-sen University  
 
 ---
 
