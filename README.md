@@ -1,7 +1,7 @@
 # AdaQual-Diff🚀  
 *Diffusion-Based Image Restoration via Adaptive Quality Prompting*
 * [Xin Su](https://scholar.google.com/citations?user=0AvoocgAAAAJ&hl=zh-CN)<sup>1</sup>  
-* [Chen Wu]<sup>2</sup>  
+* Chen Wu<sup>2</sup>  
 * Yu Zhang<sup>3</sup>  
 * Chen Lyu<sup>4</sup>  
 * [Zhuoran Zheng](https://scholar.google.com/citations?user=pXzPL-sAAAAJ&hl=zh-CN)<sup>5 ✉️</sup>  
