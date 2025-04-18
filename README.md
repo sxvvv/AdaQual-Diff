@@ -38,6 +38,16 @@ We gratefully acknowledge inspiration and foundational work from prior image res
  
 ## 📄 Citation 
 ```
+@misc{su2025adaqualdiffdiffusionbasedimagerestoration,
+      title={AdaQual-Diff: Diffusion-Based Image Restoration via Adaptive Quality Prompting}, 
+      author={Xin Su and Chen Wu and Yu Zhang and Chen Lyu and Zhuoran Zheng},
+      year={2025},
+      eprint={2504.12605},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2504.12605}, 
+}
+```
 If our work assists your research, feel free to give us a star ⭐ or cite us using
 
 
