@@ -24,7 +24,7 @@ AdaQual-Diff not only advances the theoretical understanding of quality-aware di
 ---
 ## 📑 Open-source Plan 
 - ✅ **2025.3.31**: This repo is created.
-- ✅ **2025.4.17**: Release our [manuscript]().
+- ✅ **2025.4.17**: Release our [manuscript](https://arxiv.org/abs/2504.12605).
 - ⬜ Release our visual results.
 - ⬜ Release our pretrained models.
 ---
