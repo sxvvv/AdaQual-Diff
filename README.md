@@ -37,6 +37,8 @@ We gratefully acknowledge inspiration and foundational work from prior image res
 
  
 ## 📄 Citation 
+
+If our work assists your research, feel free to give us a star ⭐ or cite us using
 ```
 @misc{su2025adaqualdiffdiffusionbasedimagerestoration,
       title={AdaQual-Diff: Diffusion-Based Image Restoration via Adaptive Quality Prompting}, 
@@ -48,7 +50,4 @@ We gratefully acknowledge inspiration and foundational work from prior image res
       url={https://arxiv.org/abs/2504.12605}, 
 }
 ```
-If our work assists your research, feel free to give us a star ⭐ or cite us using
 
-
-```
